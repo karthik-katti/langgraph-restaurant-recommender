@@ -126,8 +126,7 @@ def process_input(state: List[HumanMessage | AIMessage]) -> List[HumanMessage | 
     if response == "Ready to search":
         search_params = {
             "city": extracted["city"],
-            "price_range": extracted["price_range"],
-            "amenities": extracted["amenities"]
+            "cuisine": extracted["cuisine"],
         }
         return state + [AIMessage(content=f"Search: {json.dumps(search_params)}")]
 
@@ -143,20 +142,18 @@ def search_hotels(state: List[HumanMessage | AIMessage]) -> List[HumanMessage | 
     try:
         params = json.loads(last_message.replace("Search: ", ""))
         city = params["city"]
-        price_range = params["price_range"]
-        amenities = params["amenities"]
+        cuisine = params["cuisine"]
     except:
         return state + [AIMessage(content="Error processing search parameters.")]
 
-    query = f"Hotel in {city} with price {price_range[0]}-{price_range[1]} per night, amenities: {', '.join(amenities)}"
+    query = f"Restaurant in {city} with cuisines {cuisine}"
+    print(f"Search query: {query}")
     results = vectorstore.similarity_search_with_score(query, k=5)
 
-    min_price, max_price = price_range
     filtered_hotels = [
         doc.metadata for doc, score in results
         if doc.metadata["city"] == city
-           and min_price <= doc.metadata["price_per_night"] <= max_price
-           and all(amenity in doc.metadata["amenities"] for amenity in amenities)
+           and all(cuisine in doc.metadata["cuisines"] for cuisine in cuisine)
     ]
 
     chain = result_prompt | llm
@@ -202,7 +199,7 @@ def interactive_session():
         state = run_hotel_agent(user_input, state)
         print(state[-1].content)
 
-        if state[-1].content.startswith("No restaurants found") or not state[-1].content.startswith("Please"):
+        if state[-1].content.startswith("No restauranta found") or not state[-1].content.startswith("Please"):
             state = None
 
 
