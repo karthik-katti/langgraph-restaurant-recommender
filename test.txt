@@ -1,0 +1,172 @@
+pip install psycopg2-binary sqlalchemy langgraph fastapi uvicorn
+
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Annotated
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, add_messages, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver  # Works for Postgres too
+import uuid
+
+# 1️⃣ Define State
+class AgentState(dict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+# 2️⃣ Node Logic
+def chatbot_node(state: AgentState):
+    user_message = state["messages"][-1].content
+    response = f"Postgres-backed Echo: {user_message}"
+    state["messages"].append(AIMessage(content=response))
+    return state
+
+# 3️⃣ Build Graph with PostgreSQL
+def build_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("chatbot", chatbot_node)
+    graph.add_edge(START, "chatbot")
+    graph.add_edge("chatbot", END)
+
+    # ✅ Use PostgreSQL connection
+    conn_str = "postgresql+psycopg2://langgraph_user:securepass@localhost:5432/langgraph"
+    checkpointer = SqliteSaver.from_conn_string(conn_str)
+    return graph.compile(checkpointer=checkpointer)
+
+graph = build_graph()
+
+# 4️⃣ FastAPI App
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+    input_state = {"messages": [HumanMessage(content=req.message)]}
+
+    result = graph.invoke(input_state, config={"configurable": {"thread_id": session_id}})
+    response_text = result["messages"][-1].content
+
+    return {"session_id": session_id, "response": response_text}
+
+
+
+
+
+
+psql -h localhost -U postgres
+CREATE DATABASE langgraph;
+CREATE USER langgraph_user WITH PASSWORD 'securepass';
+GRANT ALL PRIVILEGES ON DATABASE langgraph TO langgraph_user;
+
+
+
+
+uvicorn app_postgres:app --reload
+
+
+
+
+
+pip install couchbase fastapi langgraph langchain uvicorn
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Annotated
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, add_messages, START, END
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from couchbase.cluster import Cluster, ClusterOptions
+from couchbase_core.cluster import PasswordAuthenticator
+from couchbase.collection import MutateInOptions
+import pickle, uuid
+
+# 1️⃣ Define LangGraph State
+class AgentState(dict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+# 2️⃣ Custom Couchbase Checkpointer
+class CouchbaseSaver(BaseCheckpointSaver):
+    def __init__(self, bucket):
+        self.bucket = bucket
+        self.collection = bucket.default_collection()
+
+    def put(self, config, checkpoint):
+        thread_id = config["configurable"]["thread_id"]
+        data = pickle.dumps(checkpoint)
+        self.collection.upsert(thread_id, data)
+
+    def get(self, config):
+        thread_id = config["configurable"]["thread_id"]
+        try:
+            result = self.collection.get(thread_id)
+            return pickle.loads(result.content)
+        except Exception:
+            return None
+
+# 3️⃣ Couchbase connection
+def create_bucket():
+    cluster = Cluster.connect(
+        "couchbase://localhost",
+        ClusterOptions(PasswordAuthenticator("Administrator", "password"))
+    )
+    bucket = cluster.bucket("langgraph")  # Make sure this bucket exists
+    bucket.on_connect()
+    return bucket
+
+bucket = create_bucket()
+
+# 4️⃣ LangGraph build
+def build_graph():
+    def chatbot_node(state: AgentState):
+        user_message = state["messages"][-1].content
+        response = f"Couchbase-backed Echo: {user_message}"
+        state["messages"].append(AIMessage(content=response))
+        return state
+
+    graph = StateGraph(AgentState)
+    graph.add_node("chatbot", chatbot_node)
+    graph.add_edge(START, "chatbot")
+    graph.add_edge("chatbot", END)
+
+    checkpointer = CouchbaseSaver(bucket)
+    return graph.compile(checkpointer=checkpointer)
+
+graph = build_graph()
+
+# 5️⃣ FastAPI app
+app = FastAPI()
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+    input_state = {"messages": [HumanMessage(content=req.message)]}
+
+    result = graph.invoke(input_state, config={"configurable": {"thread_id": session_id}})
+    response_text = result["messages"][-1].content
+    return {"session_id": session_id, "response": response_text}
+
+
+
+
+docker run -d --name cb -p 8091-8094:8091-8094 -p 11210:11210 couchbase
+
+
+Then:
+
+Visit http://localhost:8091
+
+Create username/password: Administrator / password
+
+Create bucket named langgraph
+
+
+uvicorn app_couchbase:app --reload
