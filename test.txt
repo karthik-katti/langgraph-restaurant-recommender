@@ -170,3 +170,189 @@ Create bucket named langgraph
 
 
 uvicorn app_couchbase:app --reload
+
+
+
+
+
+
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a hotel recommendation assistant. Extract the following from the conversation history and latest input:
+    - city: Must be one of New York, Los Angeles, Seattle, Las Vegas.
+    - cuisine: A comma-separated list like Asian, American, Italian , output as ["Asian", "American" ,"Italian"].
+
+    Output *only* valid JSON with this exact structure:
+
+    {{
+      "city": "<city or null>",
+      "cuisine": ["cuisine1", "cuisine2"] or null,
+      "response": "<message to user>"
+    }}
+
+    Rules:
+    - Output JSON only, no additional text, whitespace, or explanations.
+    - If the input contains a city not in [New York, Los Angeles, Seattle, Las Vegas], set "city" to null and "response" to "City not supported. Supported cities are New York, Los Angeles, Seattle, Las Vegas." 
+    - If all fields (city, cuisines) are present, set "response" to "Ready to search".
+    - If any field is missing, set "response" to a polite request for the missing information in this order: city, cuisine.
+    - For cuisine, parse inputs like "Asian, American" or "Asian,American" into ["Asian", "American"].
+    - If input is unclear, set "response" to a clarification request for the missing field.
+    Examples:
+    - Input: "Restaurant in New York", Output: {{"city": "New York", "cuisine": null, "response": "Please provide cuisine details (e.g., American, Asian, Italian)."}}
+    - Input: "American", History: "human: Restaurant in New York", Output: {{"city": "New York", "cuisine": ["American"], "response": "Ready to search"}}"""),
+    MessagesPlaceholder(variable_name="messages"),  # persisted conversation history
+    ("user", "{input}")  # latest message
+])
+
+Explanation
+
+MessagesPlaceholder(variable_name="messages") tells LangChain/LangGraph:
+
+“Insert the message history from the state field named messages.”
+
+This messages field comes from your LangGraph state — which is automatically persisted by the checkpointer (Postgres, SQLite, etc).
+
+So when you call:
+
+
+result = chain.invoke({"messages": persisted_state["messages"], "input": latest_input})
+
+
+
+
+def process_input_node(state: dict) -> dict:
+    chain = extract_prompt | llm  # llm is your ChatOllama, ChatOpenAI, etc.
+
+    # Just pass state (it already has messages + new input)
+    result = chain.invoke({
+        "messages": state["messages"],
+        "input": state["messages"][-1].content  # latest user input
+    })
+
+    extracted = json.loads(result.content.strip())
+    ...
+
+
+
+
+-----------
+def node_name(state: AgentState) -> AgentState:
+    ...
+
+
+
+import json
+from langchain.schema import AIMessage, HumanMessage
+from typing import List, Union
+
+def process_input_node(state: dict) -> dict:
+    """LangGraph-compatible wrapper for your logic."""
+    messages: List[Union[HumanMessage, AIMessage]] = state["messages"]
+
+    history = "\n".join([f"{msg.type}: {msg.content}" for msg in messages])
+    latest_input = messages[-1].content if messages else ""
+
+    chain = extract_prompt | llm  # your existing LangChain chain
+
+    try:
+        result = chain.invoke({"history": history, "input": latest_input})
+        print(f"Raw LLM output: {result.content}")  # Debugging
+        extracted = json.loads(result.content.strip())
+        if not all(key in extracted for key in ["city", "cuisine", "response"]):
+            raise ValueError("Missing required JSON keys")
+    except Exception as e:
+        print(f"Error parsing LLM output: {e}")
+        messages.append(AIMessage(
+            content=f"Sorry, I couldn't process your request due to an error: {str(e)}. "
+                    f"Please try again with a clear format (e.g., 'Hotel in Paris', '$100-$200', 'pool, wifi')."))
+        return {"messages": messages}
+
+    response = extracted["response"]
+    if response == "Ready to search":
+        search_params = {
+            "city": extracted["city"],
+            "cuisine": extracted["cuisine"],
+        }
+        messages.append(AIMessage(content=f"Search: {json.dumps(search_params)}"))
+    else:
+        messages.append(AIMessage(content=response))
+
+    return {"messages": messages}
+
+
+
+from langchain.schema import BaseMessage
+from langgraph.graph import StateGraph, add_messages
+from typing import Annotated
+
+class AgentState(dict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+
+
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import START, END
+
+def build_graph():
+    graph = StateGraph(AgentState)
+    graph.add_node("process", process_input_node)
+    graph.add_edge(START, "process")
+    graph.add_edge("process", END)
+
+    # Use Postgres or SQLite persistence
+    checkpointer = SqliteSaver.from_conn_string(
+        "postgresql+psycopg2://langgraph_user:securepass@localhost:5432/langgraph"
+    )
+
+    return graph.compile(checkpointer=checkpointer)
+
+
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from langchain.schema import HumanMessage
+import uuid
+
+app = FastAPI()
+graph = build_graph()
+
+class ChatRequest(BaseModel):
+    session_id: str | None = None
+    message: str
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    session_id = req.session_id or str(uuid.uuid4())
+
+    # Create input state
+    input_state = {"messages": [HumanMessage(content=req.message)]}
+
+    # ✅ LangGraph will automatically load + merge previous state from Postgres
+    result = graph.invoke(input_state, config={"configurable": {"thread_id": session_id}})
+
+    # Extract AI response
+    response_text = result["messages"][-1].content
+
+    return {"session_id": session_id, "response": response_text}
+
+
+
+5. What’s Happening Under the Hood
+
+The checkpointer (Postgres or SQLite) stores the full serialized state (messages, etc.) after every node run.
+
+When you call .invoke() again with the same thread_id:
+
+LangGraph automatically fetches the prior state from Postgres.
+
+It merges your new HumanMessage with the old messages.
+
+Then it executes your node function (process_input_node).
+
+Finally, it saves the updated messages back into the checkpointer.
+
+This gives you continuous conversational context across API calls, just like a chat session running in a loop.
+
