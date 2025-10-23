@@ -1,0 +1,99 @@
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a hotel and restaurant recommendation assistant.
+
+Your job is to help users find restaurants by city and cuisine.
+
+Rules:
+1. Supported cities: New York, Los Angeles, Seattle, Las Vegas.
+2. Always use the **conversation history** to detect the **most recent city and cuisine** mentioned by the user.
+3. If the user provides both a city and cuisine → respond "Ready to search".
+4. If the user provides only a cuisine → ask:
+   "Would you like this cuisine for the same city (<last city>) or a new city?"
+5. If the user provides only a city → ask:
+   "Would you like this city for the same cuisine (<last cuisine>) or a new cuisine?"
+6. If the user says "same city" or "same cuisine", infer their meaning from the conversation history.
+7. If city is not supported, respond with:
+   "City not supported. Supported cities are New York, Los Angeles, Seattle, Las Vegas."
+8. Always output valid JSON:
+   {{
+      "response": "<assistant reply>"
+   }}
+9. Keep responses polite and short.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    ("user", "{input}")
+])
+
+
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+def process_input(state: AgentState) -> AgentState:
+    messages = state.get("messages", [])
+    latest_input = messages[-1].content if messages else ""
+
+    chain = extract_prompt | llm
+    result = chain.invoke({"messages": messages, "input": latest_input})
+
+    try:
+        parsed = json.loads(result.content)
+        reply = parsed.get("response", "Sorry, I couldn’t process your request.")
+    except Exception:
+        reply = "Sorry, I couldn’t parse the response."
+
+    return {"messages": messages + [AIMessage(content=reply)]}
+
+
+
+
+
+graph = StateGraph(AgentState)
+graph.add_node("process_input", process_input)
+graph.add_edge(START, "process_input")
+graph.add_edge("process_input", END)
+
+app = graph.compile(checkpointer=checkpointer)
+
+
+
+
+
+
+thread_id = "user_2025_demo"
+
+# 1️⃣ First user message — mentions city
+s1 = app.invoke(
+    {"messages": [HumanMessage(content="Find me restaurants in Seattle")]},
+    config={"configurable": {"thread_id": thread_id}},
+)
+print("AI:", s1["messages"][-1].content)
+
+# 2️⃣ Second message — only cuisine
+s2 = app.invoke(
+    {"messages": [HumanMessage(content="American")]},
+    config={"configurable": {"thread_id": thread_id}},
+)
+print("AI:", s2["messages"][-1].content)
+
+# 3️⃣ Third — new cuisine only
+s3 = app.invoke(
+    {"messages": [HumanMessage(content="Japanese")]},
+    config={"configurable": {"thread_id": thread_id}},
+)
+print("AI:", s3["messages"][-1].content)
+
+# 4️⃣ Fourth — new city only
+s4 = app.invoke(
+    {"messages": [HumanMessage(content="Los Angeles")]},
+    config={"configurable": {"thread_id": thread_id}},
+)
+print("AI:", s4["messages"][-1].content)
+
+
+
+
+
+AI: Please provide cuisine details (e.g., American, Asian, Italian).
+AI: Ready to search.
+AI: Would you like this cuisine for the same city (Seattle) or a new city?
+AI: Would you like this city for the same cuisine (American) or a new cuisine?
