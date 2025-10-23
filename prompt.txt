@@ -46,3 +46,151 @@ History and prior context:
     MessagesPlaceholder(variable_name="messages"),
     ("user", "{input}")
 ])
+
+
+
+
+
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a hotel and restaurant recommendation assistant.
+You help users find restaurants by **city** and **cuisine**.
+
+You have access to previously known data:
+- Previous city: {city}
+- Previous cuisines: {cuisine}
+
+Your goal:
+1. Extract the current city and cuisine(s) from user messages.
+2. Output ONLY valid JSON:
+   {{
+     "city": "<city or null>",
+     "cuisine": ["cuisine1", "cuisine2"] or null,
+     "response": "<message to user>"
+   }}
+
+Rules:
+- Supported cities: New York, Los Angeles, Seattle, Las Vegas.
+- If user provides:
+  a) Only a **cuisine** (no city):
+      → Ask: "Would you like this cuisine for the same city (<previous city>) or a new city?"
+  b) Only a **city** (no cuisine):
+      → Ask: "Would you like this city for the same cuisine (<previous cuisine>) or a new cuisine?"
+- If user says "same city" or "same cuisine", reuse previous value.
+- If user provides new city/cuisine, update accordingly.
+- If both city and cuisine are known, respond with "Ready to search."
+- If city not supported, set city = null and respond accordingly.
+- Keep responses short and polite.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    ("user", "{input}")
+])
+
+
+
+
+
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a hotel and restaurant assistant.
+
+You have full access to the conversation history.
+
+Rules:
+1. Supported cities: New York, Los Angeles, Seattle, Las Vegas.
+2. If user provides both city and cuisine → respond "Ready to search".
+3. If user provides only a cuisine → ask: 
+   "Would you like this cuisine for the same city (<last city>) or a new city?"
+4. If user provides only a city → ask: 
+   "Would you like this city for the same cuisine (<last cuisine>) or a new cuisine?"
+5. If user says "same city" or "same cuisine", infer what they mean using the conversation history.
+6. Always output valid JSON:
+   {{
+      "response": "<assistant reply>"
+   }}
+7. Keep responses concise and polite.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    ("user", "{input}")
+])
+
+
+
+
+
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+def process_input(state: AgentState) -> AgentState:
+    messages = state.get("messages", [])
+    latest_input = messages[-1].content if messages else ""
+
+    chain = extract_prompt | llm
+    result = chain.invoke({"messages": messages, "input": latest_input})
+
+    try:
+        parsed = json.loads(result.content)
+        reply = parsed.get("response", "Sorry, I could not understand that.")
+    except Exception:
+        reply = "Sorry, I could not parse the response."
+
+    return {"messages": messages + [AIMessage(content=reply)]}
+
+
+
+
+graph = StateGraph(AgentState)
+graph.add_node("process_input", process_input)
+graph.add_edge(START, "process_input")
+graph.add_edge("process_input", END)
+
+app = graph.compile(checkpointer=checkpointer)
+
+
+
+
+thread_id = "user77"
+
+# 1️⃣ User mentions city
+s1 = app.invoke(
+    {"messages": [HumanMessage(content="I want a restaurant in Seattle")]},
+    config={"configurable": {"thread_id": thread_id}}
+)
+print("AI:", s1["messages"][-1].content)
+
+# 2️⃣ User mentions cuisine
+s2 = app.invoke(
+    {"messages": [HumanMessage(content="American")]},
+    config={"configurable": {"thread_id": thread_id}}
+)
+print("AI:", s2["messages"][-1].content)
+
+# 3️⃣ User mentions new cuisine only
+s3 = app.invoke(
+    {"messages": [HumanMessage(content="Japanese")]},
+    config={"configurable": {"thread_id": thread_id}}
+)
+print("AI:", s3["messages"][-1].content)
+
+# 4️⃣ User mentions new city only
+s4 = app.invoke(
+    {"messages": [HumanMessage(content="Los Angeles")]},
+    config={"configurable": {"thread_id": thread_id}}
+)
+print("AI:", s4["messages"][-1].content)
+
+
+
+AI: Please provide cuisine details (e.g., American, Asian, Italian).
+AI: Ready to search.
+AI: Would you like this cuisine for the same city (Seattle) or a new city?
+AI: Would you like this city for the same cuisine (American) or a new cuisine?
+
+
+
+
+Notes
+
+The LLM decides everything: last city/cuisine, whether “same city” or “same cuisine” applies.
+
+The state remains just messages, so persistence is simpler.
+
+Multiple mentions of cities/cuisines are handled naturally by the LLM reading history in chronological order.
