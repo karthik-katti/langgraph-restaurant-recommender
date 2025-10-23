@@ -194,3 +194,37 @@ The LLM decides everything: last city/cuisine, whether “same city” or “sam
 The state remains just messages, so persistence is simpler.
 
 Multiple mentions of cities/cuisines are handled naturally by the LLM reading history in chronological order.
+
+
+
+
+extract_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a hotel and restaurant recommendation assistant.
+
+Rules:
+1. Supported cities: New York, Los Angeles, Seattle, Las Vegas.
+2. Always use the **conversation history** to detect the **last mentioned city and cuisine**.
+3. If the user provides both city and cuisine → respond "Ready to search".
+4. If the user provides only a cuisine → ask:
+   "Would you like this cuisine for the same city (<last city>) or a new city?"
+5. If the user provides only a city → ask:
+   "Would you like this city for the same cuisine (<last cuisine>) or a new cuisine?"
+6. If the user says "same city" or "same cuisine", infer what they mean using the conversation history.
+7. Always output valid JSON:
+   {{
+      "response": "<assistant reply>"
+   }}
+8. Keep responses concise and polite.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    ("user", "{input}")
+])
+
+
+LLM scans all previous messages (MessagesPlaceholder) to find the most recent city and cuisine.
+
+If the user types a new cuisine only, the LLM asks whether it’s for the same city.
+
+If the user types a new city only, the LLM asks whether it’s for the same cuisine.
+
+No explicit last_city or last_cuisine state is needed — the messages themselves are sufficient.
